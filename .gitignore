@@ -1,0 +1,28 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Node / web (if used later)
+node_modules/
+dist/
+build/
+
+# Arduino / compiled stuff (for later)
+*.hex
+*.elf
+*.bin
+.pio/
+.arduinoIDE/
+
+# Editor settings
+.idea/
+.vscode/
+*.swp

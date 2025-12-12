@@ -1,42 +1,34 @@
-# WireBot ⚙️  
-### Web-Controlled Automated Wire Cutting Machine
+# WireBot ⚙️
+### My Web‑Controlled Automated Wire Cutting Machine
 
-WireBot is an open-source, high-precision wire cutting robot powered by:
+WireBot is my personal project to build a CNC‑style, web‑controlled wire cutting machine using:
 
-- **Raspberry Pi Zero 2 W** (Web UI + API backend)
-- **Pico A** (Real-time motion engine for 5× steppers)
-- **Pico B** (Servos, fans, temperature IO)
-- **TMC2209 stepper drivers**
-- **24 V CNC-style power architecture**
+- Raspberry Pi Zero 2 W (web UI + backend)
+- Raspberry Pi Pico A (real‑time motion controller for 5 steppers)
+- Raspberry Pi Pico B (IO controller for servos, fans, temperature)
+- TMC2209 stepper drivers
+- 24 V + 5 V dual‑rail power
 
----
+This repository currently contains **only documentation and structure** — no real firmware or backend code yet.
+I’m using it as a clean starting point for design, wiring, and planning before I write the actual code.
 
-## 🚀 Features
+## Repository Layout
 
-- Full **Web UI** (no physical buttons required)
-- Real-time multi-stepper motion engine  
-- Automatic homing with 4 endstops  
-- Job configuration (length, quantity, profile)
-- Servo-controlled cutter / clamp mechanisms  
-- Temperature monitoring + fan SSR control  
-- Live logs & progress tracking  
-- Modular architecture (easy to expand)
+- `backend/` – notes about the future API server on the Raspberry Pi
+- `firmware/` – notes and pin maps for Pico A & Pico B firmware
+- `webui/` – user flow and interface planning
+- `hardware/` – power architecture, wiring notes, pinout tables
+- `docs/` – overall system architecture, serial protocol, roadmap
 
----
+## Status
 
-## 🧠 System Architecture
+- [x] Name + concept
+- [x] Hardware architecture (24 V + 5 V, Pi + 2× Pico)
+- [x] Pin planning for all controllers
+- [x] Documentation skeleton
+- [ ] Firmware implementation
+- [ ] Backend implementation
+- [ ] Web UI implementation
+- [ ] First real test on hardware
 
-| Component | Role |
-|----------|------|
-| **Pi Zero 2 W** | Hosts Web UI + API → sends commands to Picos via USB |
-| **Pico A** | Controls 5× TMC2209 steppers + endstops (real-time motion) |
-| **Pico B** | Controls 2 servos, 1–2 fans, temperature sensor |
-| **24V PSU** | Powers motors + fans |
-| **5V buck converter** | Powers Pi + Picos + servos |
-
-See `/docs/system_architecture.md` for full details.
-
----
-
-## 📦 Project Layout
-
+This is a **work in progress** and intentionally documentation‑first.
