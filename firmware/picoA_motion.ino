@@ -1,22 +1,18 @@
 #include <Arduino.h>
 
 // =====================================================
-// WireBot – Pico A Motion Firmware (v0.2)
-// 5× TMC2209 (STEP/DIR/EN) + 4× NC microswitch inputs
-// USB Serial text commands
+// WireBot – Pico A Motion Firmware (v0.3)
+// Adds: steps/mm, MOVE_MM, GOTO_MM, SETCH_MM, blade positions in mm.
 //
-// SWITCH WIRING (IMPORTANT):
-// - You said: NC to GND + INPUT_PULLUP
-//   => NOT HIT: pin reads LOW (closed to GND)
-//   => HIT/TRIGGERED: pin reads HIGH (opens, pulled up)
-// So: TRIGGERED = HIGH
+// ASSUMPTIONS (edit if needed):
+// - Motors: 1.8° (200 steps/rev)
+// - Microstepping: 16×
+// - MMU belt: GT2 20T => 40 mm/rev => 80 steps/mm
+// - Blade leadscrew: 8 mm lead/rev => 400 steps/mm
 //
-// Motor roles (current plan):
-// M1 = MMU_BELT (channel selector belt, has home switch)
-// M2 = PRELOAD_PUSH (NEMA14 pancake, pushes wire to preload switch E1)
-// M3 = FEEDER (NEMA17 feed)
-// M4 = BLADE (cut/strip depth motor, home switch at FULL CUT / CLOSED)
-// M5 = RESERVED (2nd blade axis later / future expansion)
+// SWITCH WIRING:
+// - NC to GND + INPUT_PULLUP
+// - Triggered/HIT => pin reads HIGH
 // =====================================================
 
 // -----------------------------
@@ -42,43 +38,48 @@
 #define M5_DIR_PIN    15
 #define M5_EN_PIN     16
 
-// Switch inputs (NC to GND => triggered HIGH)
-#define SW1_PIN  17  // E1: PRELOAD_HIT
-#define SW2_PIN  18  // E2: FEEDER_ENTRY
-#define SW3_PIN  19  // E3: CUT_HOME (CLOSED / FULL CUT)
-#define SW4_PIN  20  // E4: MMU_HOME (belt selector home)
+#define SW1_PIN  17  // PRELOAD_HIT
+#define SW2_PIN  18  // FEEDER_ENTRY
+#define SW3_PIN  19  // CUT_HOME (CLOSED / FULL CUT)
+#define SW4_PIN  20  // MMU_HOME (belt selector)
 
 #define STATUS_LED_PIN 21
 #define ONBOARD_LED    25
 
 static const uint32_t STEP_PULSE_US = 3;
 
-// Defaults (steps/s, steps/s^2)
-static const float DEFAULT_VMAX  = 2000.0f;
-static const float DEFAULT_ACCEL = 4000.0f;
+static const float DEFAULT_VMAX  = 2000.0f;   // steps/s
+static const float DEFAULT_ACCEL = 4000.0f;   // steps/s^2
 
-// Homing defaults
 static const float HOME_V     = 700.0f;
 static const float HOME_ACCEL = 2500.0f;
 static const uint32_t HOME_TIMEOUT_MS = 20000;
 
-// Enable polarity
 static const bool EN_ACTIVE_LOW = true;
-
-// Switch polarity (NC to GND with pullup => triggered HIGH)
 static const bool SWITCH_TRIGGERED_HIGH = true;
 
 // -----------------------------
-// Channel + blade calibration storage (RAM only for now)
+// SPMM defaults (editable at runtime)
+// -----------------------------
+static float spmm[5] = {
+  80.0f,   // M1 MMU_BELT (20T GT2)
+  0.0f,    // M2 PRELOAD_PUSH (unknown yet, leave 0 until you measure)
+  0.0f,    // M3 FEEDER (unknown yet)
+  400.0f,  // M4 BLADE leadscrew 8mm lead
+  0.0f     // M5 reserved
+};
+
+// -----------------------------
+// Channel + blade calibration (steps, RAM only)
 // -----------------------------
 static const int MAX_CH = 16;
-static int32_t chPos[MAX_CH + 1];   // 1..MAX_CH
+static int32_t chPos[MAX_CH + 1];   // channel positions in steps (M1)
 static int currentCh = 0;
 
-// Blade axis positions relative to CUT_HOME (closed/full cut) = 0
-static int32_t bladeOpenPos  = 2000;  // steps away from closed (safe open)
-static int32_t bladeCutPos   = 0;     // full cut (home)
-static int32_t bladeStripPos = 400;   // shallow depth (example)
+// Blade axis positions relative to CUT_HOME (closed) = 0
+static int32_t bladeOpenPos  = 2000;
+static int32_t bladeCutPos   = 0;
+static int32_t bladeStripPos = 400;
 
 // =====================================================
 // Axis model
@@ -106,12 +107,9 @@ struct Axis {
 
   float jogV = 0.0f;
 
-  // homing
   int swPin = -1;
   bool hasSwitch = false;
   uint32_t homeStartMs = 0;
-
-  // homing direction (toward switch)
   int8_t homeDir = -1;
 };
 
@@ -159,7 +157,6 @@ static inline void axisStepOnce(Axis& a) {
   a.posSteps += (a.dir > 0) ? +1 : -1;
 }
 
-// d = v^2/(2a)
 static inline float decelDistanceSteps(float v, float a) {
   if (a <= 1e-6f) return 0.0f;
   return (v * v) / (2.0f * a);
@@ -168,6 +165,15 @@ static inline float decelDistanceSteps(float v, float a) {
 static Axis* findAxisByName(const String& s) {
   for (auto &a : ax) if (s == a.name) return &a;
   return nullptr;
+}
+
+static int axisIndex(const String& s) {
+  if (s == "M1") return 0;
+  if (s == "M2") return 1;
+  if (s == "M3") return 2;
+  if (s == "M4") return 3;
+  if (s == "M5") return 4;
+  return -1;
 }
 
 static void startMoveAbs(Axis& a, int32_t targetAbs, float vmax, float accel) {
@@ -227,22 +233,19 @@ static void updateAxis(Axis& a, uint32_t nowUs) {
   if (!a.enabled) return;
   if (!(a.moving || a.jogging || a.homing)) return;
 
-  // Home timeout
   if (a.homing && (millis() - a.homeStartMs) > HOME_TIMEOUT_MS) {
     axisStop(a);
     Serial.print("ERR HOME_TIMEOUT "); Serial.println(a.name);
     return;
   }
 
-  // If homing and already triggered, stop immediately
   if (a.homing && axisSwitchTriggered(a)) {
     axisStop(a);
-    a.posSteps = 0; // home is zero
+    a.posSteps = 0;
     Serial.print("OK HOME "); Serial.println(a.name);
     return;
   }
 
-  // Speed integration
   uint32_t dtUs = nowUs - a.lastUpdateUs;
   if (dtUs == 0) dtUs = 1;
   a.lastUpdateUs = nowUs;
@@ -270,11 +273,9 @@ static void updateAxis(Axis& a, uint32_t nowUs) {
   if (a.jogging) desiredV = a.jogV;
   if (a.homing)  desiredV = a.vmax;
 
-  // accel/decel
   if (a.v < desiredV) a.v = min(desiredV, a.v + a.accel * dt);
   else if (a.v > desiredV) a.v = max(desiredV, a.v - a.accel * dt);
 
-  // finish snap
   if (a.moving) {
     int32_t remAbs = abs(a.targetSteps - a.posSteps);
     if (a.v < 5.0f && remAbs <= 2) {
@@ -297,14 +298,12 @@ static void updateAxis(Axis& a, uint32_t nowUs) {
   while ((uint32_t)(nowUs - a.lastStepUs) >= a.stepIntervalUs) {
     a.lastStepUs += a.stepIntervalUs;
 
-    // If moving and reached
     if (a.moving && a.posSteps == a.targetSteps) {
       axisStop(a);
       Serial.print("OK DONE "); Serial.println(a.name);
       return;
     }
 
-    // If homing and switch triggers after a step
     axisStepOnce(a);
 
     if (a.homing && axisSwitchTriggered(a)) {
@@ -320,13 +319,12 @@ static void updateAxis(Axis& a, uint32_t nowUs) {
       return;
     }
 
-    if (a.stepIntervalUs < 200) break; // guard
+    if (a.stepIntervalUs < 200) break;
   }
 }
 
 // =====================================================
-// PRELOAD macro state machine (non-blocking)
-// Moves M2 forward until SW1 triggers, then backoff.
+// PRELOAD macro (M2 until SW1 triggers, then backoff)
 // =====================================================
 enum PreloadState : uint8_t { PL_IDLE=0, PL_PUSHING=1, PL_BACKOFF=2 };
 static PreloadState plState = PL_IDLE;
@@ -337,7 +335,7 @@ static float plV = 800.0f;
 static float plA = 2500.0f;
 
 static void preloadStart(int32_t maxSteps, int32_t backoffSteps, float vmax, float accel) {
-  Axis &m2 = ax[1]; // M2
+  Axis &m2 = ax[1];
   if (!m2.enabled) { Serial.println("ERR DRIVER_DISABLED"); return; }
 
   plState = PL_PUSHING;
@@ -347,7 +345,6 @@ static void preloadStart(int32_t maxSteps, int32_t backoffSteps, float vmax, flo
   plV = vmax;
   plA = accel;
 
-  // Push direction = + (you can flip later if needed)
   startJog(m2, +plV, plA);
   Serial.println("OK PRELOAD START");
 }
@@ -359,11 +356,9 @@ static void preloadUpdate() {
   int32_t pushed = abs(m2.posSteps - plStartPos);
 
   if (plState == PL_PUSHING) {
-    // Stop condition: SW1 triggered (HIGH) OR maxSteps reached
     if (swTriggered(SW1_PIN)) {
       axisStop(m2);
       plState = PL_BACKOFF;
-      // backoff is negative direction
       startMoveRel(m2, -plBackoff, plV, plA);
       Serial.println("OK PRELOAD HIT");
       return;
@@ -375,7 +370,6 @@ static void preloadUpdate() {
       return;
     }
   } else if (plState == PL_BACKOFF) {
-    // Wait for M2 to finish its move (handled by updateAxis)
     if (!(m2.moving || m2.jogging || m2.homing)) {
       plState = PL_IDLE;
       Serial.println("OK PRELOAD DONE");
@@ -384,32 +378,42 @@ static void preloadUpdate() {
 }
 
 // =====================================================
-// Serial parser
+// Helpers: mm ↔ steps
+// =====================================================
+static bool hasSpmm(int idx) {
+  return idx >= 0 && idx < 5 && spmm[idx] > 0.0001f;
+}
+
+static int32_t mmToSteps(int idx, float mm) {
+  return (int32_t)lroundf(mm * spmm[idx]);
+}
+
+static float stepsToMm(int idx, int32_t steps) {
+  if (!hasSpmm(idx)) return 0.0f;
+  return (float)steps / spmm[idx];
+}
+
+// =====================================================
+// Serial command parser
 // =====================================================
 static String inLine;
 
 static void printHelp() {
-  Serial.println("WireBot PicoA v0.2 commands:");
-  Serial.println("  HELP");
-  Serial.println("  PING");
-  Serial.println("  STATUS?");
-  Serial.println("  SW?                         (print switch states)");
-  Serial.println("  EN <0|1>");
-  Serial.println("  AXEN <Mx> <0|1>");
-  Serial.println("  STOP");
+  Serial.println("WireBot PicoA v0.3 commands:");
+  Serial.println("  HELP | PING | STATUS? | SW?");
+  Serial.println("  EN <0|1> | AXEN <Mx> <0|1> | STOP");
   Serial.println("  MOVE <Mx> <steps> [v] [a]");
   Serial.println("  GOTO <Mx> <pos> [v] [a]");
   Serial.println("  JOG  <Mx> <v> [a]");
-  Serial.println("  HOME <M1|M4|ALL>            (homes MMU and/or BLADE)");
-  Serial.println("  SETCH <n> <posSteps>        (store channel belt position)");
-  Serial.println("  CH <n> [v] [a]              (go to channel n)");
-  Serial.println("  CH?                         (print current channel + table)");
-  Serial.println("  PRELOAD <maxSteps> <backoff> [v] [a]  (M2 until SW1 then backoff)");
-  Serial.println("  SETOPEN <steps>             (blade open position)");
-  Serial.println("  SETSTRIP <steps>            (strip depth position)");
-  Serial.println("  OPEN                        (go blade open)");
-  Serial.println("  CUT                         (ensure full cut closed, then open)");
-  Serial.println("  STRIP                       (go strip depth, then open)");
+  Serial.println("  HOME <M1|M4|ALL>");
+  Serial.println("  SPMM? | SETSPMM <Mx> <steps_per_mm>");
+  Serial.println("  MOVE_MM <Mx> <mm> [v_mm_s] [a_mm_s2]");
+  Serial.println("  GOTO_MM <Mx> <mm> [v_mm_s] [a_mm_s2]");
+  Serial.println("  SETCH <n> <posSteps> | SETCH_MM <n> <mm> | CH <n> | CH?");
+  Serial.println("  PRELOAD <maxSteps> <backoff> [v] [a]");
+  Serial.println("  SETOPEN <steps> | SETOPEN_MM <mm>");
+  Serial.println("  SETSTRIP <steps> | SETSTRIP_MM <mm>");
+  Serial.println("  OPEN | CUT | STRIP");
 }
 
 static void printSwitches() {
@@ -419,24 +423,35 @@ static void printSwitches() {
   Serial.print(" SW4_MMU_HOME="); Serial.println(swTriggered(SW4_PIN) ? 1 : 0);
 }
 
+static void printSpmm() {
+  Serial.print("SPMM M1="); Serial.print(spmm[0], 3);
+  Serial.print(" M2="); Serial.print(spmm[1], 3);
+  Serial.print(" M3="); Serial.print(spmm[2], 3);
+  Serial.print(" M4="); Serial.print(spmm[3], 3);
+  Serial.print(" M5="); Serial.println(spmm[4], 3);
+}
+
 static void printStatus() {
   bool busy = false;
   for (auto &a : ax) if (a.moving || a.jogging || a.homing) { busy = true; break; }
 
   Serial.print("STATUS "); Serial.println(busy ? "BUSY" : "IDLE");
   Serial.print("CH="); Serial.println(currentCh);
+  printSpmm();
 
-  for (auto &a : ax) {
+  for (int i = 0; i < 5; i++) {
+    auto &a = ax[i];
     Serial.print(a.name);
     Serial.print(" pos="); Serial.print(a.posSteps);
+    if (hasSpmm(i)) {
+      Serial.print(" ("); Serial.print(stepsToMm(i, a.posSteps), 3); Serial.print("mm)");
+    }
     Serial.print(" en="); Serial.print(a.enabled ? 1 : 0);
     Serial.print(" mode=");
     if (a.homing) Serial.print("HOME");
     else if (a.jogging) Serial.print("JOG");
     else if (a.moving) Serial.print("MOVE");
     else Serial.print("IDLE");
-    Serial.print(" v="); Serial.print(a.v, 1);
-    if (a.hasSwitch) { Serial.print(" sw="); Serial.print(axisSwitchTriggered(a) ? 1 : 0); }
     Serial.println();
   }
 
@@ -445,20 +460,31 @@ static void printStatus() {
   Serial.print(" cut="); Serial.println(bladeCutPos);
 }
 
+static Axis* axisFromTok(const String& tok, int &idxOut) {
+  String t = tok; t.toUpperCase();
+  idxOut = -1;
+  if (t == "M1") idxOut = 0;
+  else if (t == "M2") idxOut = 1;
+  else if (t == "M3") idxOut = 2;
+  else if (t == "M4") idxOut = 3;
+  else if (t == "M5") idxOut = 4;
+  if (idxOut < 0) return nullptr;
+  return &ax[idxOut];
+}
+
 static float parseFloatOr(const String& s, float fallback) {
   if (s.length() == 0) return fallback;
   return s.toFloat();
 }
 
 static void handleCommand(const String& line) {
-  // Tokenize
-  String t[8];
+  String t[10];
   int n = 0;
   int start = 0;
   for (int i = 0; i <= (int)line.length(); i++) {
     if (i == (int)line.length() || line[i] == ' ') {
       if (i > start) {
-        if (n < 8) t[n++] = line.substring(start, i);
+        if (n < 10) t[n++] = line.substring(start, i);
       }
       start = i + 1;
     }
@@ -472,6 +498,7 @@ static void handleCommand(const String& line) {
   if (cmd == "PING") { Serial.println("OK PONG"); return; }
   if (cmd == "STATUS?" || cmd == "STATUS") { printStatus(); return; }
   if (cmd == "SW?") { printSwitches(); return; }
+  if (cmd == "SPMM?") { printSpmm(); return; }
 
   if (cmd == "STOP") {
     for (auto &a : ax) axisStop(a);
@@ -490,7 +517,7 @@ static void handleCommand(const String& line) {
 
   if (cmd == "AXEN") {
     if (n < 3) { Serial.println("ERR AXEN Mx 0|1"); return; }
-    Axis* a = findAxisByName(t[1]);
+    int idx; Axis* a = axisFromTok(t[1], idx);
     if (!a) { Serial.println("ERR BAD_AXIS"); return; }
     int en = t[2].toInt();
     axisEnable(*a, en != 0);
@@ -498,28 +525,59 @@ static void handleCommand(const String& line) {
     return;
   }
 
+  if (cmd == "SETSPMM") {
+    if (n < 3) { Serial.println("ERR SETSPMM Mx steps_per_mm"); return; }
+    int idx; Axis* a = axisFromTok(t[1], idx);
+    if (!a) { Serial.println("ERR BAD_AXIS"); return; }
+    float v = t[2].toFloat();
+    if (v <= 0.0f) { Serial.println("ERR BAD_SPMM"); return; }
+    spmm[idx] = v;
+    Serial.print("OK SETSPMM "); Serial.print(a->name); Serial.print(" "); Serial.println(spmm[idx], 3);
+    return;
+  }
+
   if (cmd == "MOVE" || cmd == "GOTO") {
     if (n < 3) { Serial.println("ERR MOVE/GOTO usage"); return; }
-    Axis* a = findAxisByName(t[1]);
+    int idx; Axis* a = axisFromTok(t[1], idx);
     if (!a) { Serial.println("ERR BAD_AXIS"); return; }
 
     int32_t val = (int32_t)t[2].toInt();
     float vmax = (n >= 4) ? parseFloatOr(t[3], DEFAULT_VMAX) : DEFAULT_VMAX;
     float acc  = (n >= 5) ? parseFloatOr(t[4], DEFAULT_ACCEL) : DEFAULT_ACCEL;
 
-    if (cmd == "MOVE") {
-      startMoveRel(*a, val, vmax, acc);
-      Serial.print("OK MOVE "); Serial.print(a->name); Serial.print(" "); Serial.println(val);
-    } else {
-      startMoveAbs(*a, val, vmax, acc);
-      Serial.print("OK GOTO "); Serial.print(a->name); Serial.print(" "); Serial.println(val);
-    }
+    if (cmd == "MOVE") startMoveRel(*a, val, vmax, acc);
+    else              startMoveAbs(*a, val, vmax, acc);
+
+    Serial.print("OK "); Serial.print(cmd); Serial.print(" "); Serial.print(a->name); Serial.print(" "); Serial.println(val);
+    return;
+  }
+
+  if (cmd == "MOVE_MM" || cmd == "GOTO_MM") {
+    if (n < 3) { Serial.println("ERR MOVE_MM/GOTO_MM Mx mm [v_mm_s] [a_mm_s2]"); return; }
+    int idx; Axis* a = axisFromTok(t[1], idx);
+    if (!a) { Serial.println("ERR BAD_AXIS"); return; }
+    if (!hasSpmm(idx)) { Serial.println("ERR NO_SPMM"); return; }
+
+    float mm = t[2].toFloat();
+    float vmm = (n >= 4) ? parseFloatOr(t[3], 50.0f) : 50.0f;     // mm/s default
+    float amm = (n >= 5) ? parseFloatOr(t[4], 200.0f) : 200.0f;   // mm/s^2 default
+
+    int32_t steps = mmToSteps(idx, mm);
+    float vmax = fabs(vmm) * spmm[idx];  // steps/s
+    float acc  = fabs(amm) * spmm[idx];  // steps/s^2
+
+    if (cmd == "MOVE_MM") startMoveRel(*a, steps, vmax, acc);
+    else                 startMoveAbs(*a, steps, vmax, acc);
+
+    Serial.print("OK "); Serial.print(cmd); Serial.print(" "); Serial.print(a->name);
+    Serial.print(" mm="); Serial.print(mm, 3);
+    Serial.print(" steps="); Serial.println(steps);
     return;
   }
 
   if (cmd == "JOG") {
     if (n < 3) { Serial.println("ERR JOG Mx v [a]"); return; }
-    Axis* a = findAxisByName(t[1]);
+    int idx; Axis* a = axisFromTok(t[1], idx);
     if (!a) { Serial.println("ERR BAD_AXIS"); return; }
     float v = t[2].toFloat();
     float acc = (n >= 4) ? parseFloatOr(t[3], DEFAULT_ACCEL) : DEFAULT_ACCEL;
@@ -528,25 +586,22 @@ static void handleCommand(const String& line) {
     return;
   }
 
-  // HOME only for M1 and M4 (and ALL = those two)
   if (cmd == "HOME") {
     if (n < 2) { Serial.println("ERR HOME M1|M4|ALL"); return; }
     String who = t[1]; who.toUpperCase();
     if (who == "ALL") {
-      startHome(ax[0]); // M1
-      startHome(ax[3]); // M4
+      startHome(ax[0]);
+      startHome(ax[3]);
       Serial.println("OK HOME ALL");
       return;
     }
-    Axis* a = findAxisByName(who);
-    if (!a) { Serial.println("ERR BAD_AXIS"); return; }
     if (who != "M1" && who != "M4") { Serial.println("ERR HOME_ONLY_M1_M4"); return; }
+    int idx; Axis* a = axisFromTok(who, idx);
     startHome(*a);
     Serial.print("OK HOME "); Serial.println(a->name);
     return;
   }
 
-  // Channel table
   if (cmd == "SETCH") {
     if (n < 3) { Serial.println("ERR SETCH n posSteps"); return; }
     int ch = t[1].toInt();
@@ -557,11 +612,26 @@ static void handleCommand(const String& line) {
     return;
   }
 
+  if (cmd == "SETCH_MM") {
+    if (n < 3) { Serial.println("ERR SETCH_MM n mm"); return; }
+    if (!hasSpmm(0)) { Serial.println("ERR NO_SPMM_M1"); return; }
+    int ch = t[1].toInt();
+    float mm = t[2].toFloat();
+    if (ch < 1 || ch > MAX_CH) { Serial.println("ERR BAD_CH"); return; }
+    chPos[ch] = mmToSteps(0, mm);
+    Serial.print("OK SETCH_MM "); Serial.print(ch); Serial.print(" mm="); Serial.print(mm, 3);
+    Serial.print(" steps="); Serial.println(chPos[ch]);
+    return;
+  }
+
   if (cmd == "CH?") {
     Serial.print("CH="); Serial.println(currentCh);
     for (int i = 1; i <= MAX_CH; i++) {
-      if (chPos[i] != 0 || i == 1) { // show at least CH1
-        Serial.print("CH"); Serial.print(i); Serial.print("="); Serial.println(chPos[i]);
+      if (chPos[i] != 0 || i == 1) {
+        Serial.print("CH"); Serial.print(i); Serial.print("=");
+        Serial.print(chPos[i]);
+        if (hasSpmm(0)) { Serial.print(" ("); Serial.print(stepsToMm(0, chPos[i]), 3); Serial.print("mm)"); }
+        Serial.println();
       }
     }
     return;
@@ -575,15 +645,12 @@ static void handleCommand(const String& line) {
     float vmax = (n >= 3) ? parseFloatOr(t[2], DEFAULT_VMAX) : DEFAULT_VMAX;
     float acc  = (n >= 4) ? parseFloatOr(t[3], DEFAULT_ACCEL) : DEFAULT_ACCEL;
 
-    // Require M1 homed logically (pos=0 at SW4)
-    // We don't hard-enforce, but it's recommended.
     startMoveAbs(ax[0], chPos[ch], vmax, acc);
     currentCh = ch;
     Serial.print("OK CH "); Serial.println(ch);
     return;
   }
 
-  // PRELOAD macro (M2 until SW1 then backoff)
   if (cmd == "PRELOAD") {
     if (n < 3) { Serial.println("ERR PRELOAD maxSteps backoff [v] [a]"); return; }
     int32_t maxS = (int32_t)t[1].toInt();
@@ -594,50 +661,57 @@ static void handleCommand(const String& line) {
     return;
   }
 
-  // Blade calibration
   if (cmd == "SETOPEN") {
     if (n < 2) { Serial.println("ERR SETOPEN steps"); return; }
     bladeOpenPos = (int32_t)t[1].toInt();
     Serial.print("OK SETOPEN "); Serial.println(bladeOpenPos);
     return;
   }
+  if (cmd == "SETOPEN_MM") {
+    if (n < 2) { Serial.println("ERR SETOPEN_MM mm"); return; }
+    if (!hasSpmm(3)) { Serial.println("ERR NO_SPMM_M4"); return; }
+    float mm = t[1].toFloat();
+    bladeOpenPos = mmToSteps(3, mm);
+    Serial.print("OK SETOPEN_MM mm="); Serial.print(mm, 3);
+    Serial.print(" steps="); Serial.println(bladeOpenPos);
+    return;
+  }
+
   if (cmd == "SETSTRIP") {
     if (n < 2) { Serial.println("ERR SETSTRIP steps"); return; }
     bladeStripPos = (int32_t)t[1].toInt();
     Serial.print("OK SETSTRIP "); Serial.println(bladeStripPos);
     return;
   }
-  if (cmd == "SETCUT") {
-    bladeCutPos = 0; // home position is full cut by definition
-    Serial.println("OK SETCUT 0");
+  if (cmd == "SETSTRIP_MM") {
+    if (n < 2) { Serial.println("ERR SETSTRIP_MM mm"); return; }
+    if (!hasSpmm(3)) { Serial.println("ERR NO_SPMM_M4"); return; }
+    float mm = t[1].toFloat();
+    bladeStripPos = mmToSteps(3, mm);
+    Serial.print("OK SETSTRIP_MM mm="); Serial.print(mm, 3);
+    Serial.print(" steps="); Serial.println(bladeStripPos);
     return;
   }
 
-  // Blade actions (M4)
   if (cmd == "OPEN") {
     startMoveAbs(ax[3], bladeOpenPos, 1200, 3000);
     Serial.println("OK OPEN");
     return;
   }
   if (cmd == "CUT") {
-    // Ensure full cut (0), then open
     startMoveAbs(ax[3], bladeCutPos, 1200, 3000);
-    // Opening after will be done by host or you can manually send OPEN;
-    Serial.println("OK CUT (go to 0 then send OPEN)");
+    Serial.println("OK CUT (at 0). send OPEN after if needed");
     return;
   }
   if (cmd == "STRIP") {
     startMoveAbs(ax[3], bladeStripPos, 1200, 3000);
-    Serial.println("OK STRIP (go to depth then send OPEN)");
+    Serial.println("OK STRIP (at depth). send OPEN after if needed");
     return;
   }
 
   Serial.println("ERR UNKNOWN_CMD");
 }
 
-// =====================================================
-// Setup / Loop
-// =====================================================
 static void initAxisPins(Axis& a) {
   pinMode(a.stepPin, OUTPUT);
   pinMode(a.dirPin, OUTPUT);
@@ -646,7 +720,6 @@ static void initAxisPins(Axis& a) {
   digitalWrite(a.stepPin, LOW);
   digitalWrite(a.dirPin, LOW);
 
-  // default disabled
   if (EN_ACTIVE_LOW) digitalWrite(a.enPin, HIGH);
   else              digitalWrite(a.enPin, LOW);
 
@@ -664,35 +737,26 @@ void setup() {
   digitalWrite(STATUS_LED_PIN, LOW);
   digitalWrite(ONBOARD_LED, LOW);
 
-  // Switch inputs
   pinMode(SW1_PIN, INPUT_PULLUP);
   pinMode(SW2_PIN, INPUT_PULLUP);
   pinMode(SW3_PIN, INPUT_PULLUP);
   pinMode(SW4_PIN, INPUT_PULLUP);
 
-  // Init axes
   for (auto &a : ax) initAxisPins(a);
 
-  // Attach switches to only the axes that home:
-  // M1 homes to SW4, M4 homes to SW3.
+  // Only M1 and M4 have home switches:
   ax[0].hasSwitch = true; ax[0].swPin = SW4_PIN; ax[0].homeDir = -1; // MMU_HOME
   ax[3].hasSwitch = true; ax[3].swPin = SW3_PIN; ax[3].homeDir = -1; // CUT_HOME (closed)
 
-  // Others do not have home switches in this version
-  ax[1].hasSwitch = false; // M2 uses SW1 in PRELOAD macro
-  ax[2].hasSwitch = false;
-  ax[4].hasSwitch = false;
-
-  // init channel table (safe defaults)
   for (int i = 1; i <= MAX_CH; i++) chPos[i] = 0;
 
-  Serial.println("OK WireBot PicoA v0.2 READY");
+  Serial.println("OK WireBot PicoA v0.3 READY");
   Serial.println("NC switches: TRIGGERED=HIGH");
+  Serial.println("Defaults: M1 SPMM=80, M4 SPMM=400");
   Serial.println("Type HELP for commands");
 }
 
 void loop() {
-  // Blink LED
   static uint32_t lastBlink = 0;
   static bool led = false;
   uint32_t nowMs = millis();
@@ -702,7 +766,6 @@ void loop() {
     digitalWrite(ONBOARD_LED, led ? HIGH : LOW);
   }
 
-  // Serial lines
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\r') continue;
@@ -712,14 +775,12 @@ void loop() {
       line.trim();
       if (line.length() > 0) handleCommand(line);
     } else {
-      if (inLine.length() < 180) inLine += c;
+      if (inLine.length() < 200) inLine += c;
     }
   }
 
-  // Motion update
   uint32_t nowUs = micros();
   for (auto &a : ax) updateAxis(a, nowUs);
 
-  // Macro update
   preloadUpdate();
 }
