@@ -28,3 +28,4 @@ build/
 *.swp
 webui/.env.local
 webui/wirebot-webui.rar
+webui/wirebot-webui/package-lock.json
