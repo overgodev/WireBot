@@ -27,3 +27,4 @@ build/
 .vscode/
 *.swp
 webui/.env.local
+webui/wirebot-webui.rar
